@@ -1,0 +1,8 @@
+anthropic>=0.40.0
+playwright>=1.49.0
+pymupdf>=1.25.0
+fpdf2>=2.8.0
+imageio>=2.36.0
+Pillow>=11.0.0
+PyGithub>=2.5.0
+python-dotenv>=1.0.0
