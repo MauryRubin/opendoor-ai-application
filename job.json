@@ -1,0 +1,11 @@
+{
+  "application_url": "https://ats.rippling.com/en-CA/opendoor/jobs/f572e889-0644-4590-8a5a-64f73d7db17d/apply",
+  "company": "Opendoor",
+  "role_title": "Operations AI Engineer",
+  "location": "Toronto",
+  "repo_name": "opendoor-ai-application",
+  "narrative_hook": "Opendoor's CEO challenged applicants to apply to the Operations AI Engineer role using only AI for a chance to skip to the final round",
+  "challenger_title": "CEO",
+  "hiring_team_greeting": "Dear Opendoor Hiring Team,",
+  "job_description": "Operations AI Engineer at Opendoor (Toronto)\n\nKey Responsibilities:\n- Transform ambiguous business challenges into system designs and implementation roadmaps\n- Prototype and deploy rapid experiments to improve operational workflows\n- Build AI-powered internal tools and automation systems\n- Evaluate build versus integrate decisions for AI tooling\n- Establish monitoring for model performance, latency, and drift detection\n- Conduct troubleshooting and root cause analysis for production issues\n- Partner with data scientists to operationalize machine learning models\n\nRequired Qualifications:\n- 5+ years of experience in operations and data\n- SQL proficiency, API integration, LLM deployment understanding\n- Machine learning lifecycle concepts\n- High agency, systems thinking, strong communication\n\nDesired Skills:\n- AI coding assistants (Claude, Cursor)\n- Workflow automation platforms (Gumloop, Zapier)\n- Data platforms (Snowflake, Databricks)\n- Agentic AI frameworks and automation flows\n"
+}

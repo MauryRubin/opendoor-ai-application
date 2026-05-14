@@ -1,0 +1,33 @@
+{
+  "name": "Jane Q Applicant",
+  "first_name": "Jane",
+  "last_name": "Applicant",
+  "email": "jane@example.com",
+  "phone": "(555) 555-5555",
+  "address": "123 Example St",
+  "city": "Toronto",
+  "province": "Ontario",
+  "country": "Canada",
+  "postal_code": "",
+  "linkedin": "https://www.linkedin.com/in/example/",
+  "github_username": "your-github-username",
+  "current_role": "Your current title",
+  "current_company": "Your current company",
+  "work_authorization": "Canadian citizen",
+  "requires_sponsorship": "No",
+  "resume_filename": "Resume.pdf",
+  "eeo_responses": {
+    "gender": "Prefer not to answer",
+    "ethnicity": "Prefer not to answer",
+    "race": "Prefer not to answer",
+    "veteran_status": "Prefer not to answer",
+    "disability_status": "Prefer not to answer",
+    "pronouns": ""
+  },
+  "consent_responses": {
+    "sms_updates": "decline",
+    "marketing_email": "decline",
+    "application_status_updates": "accept",
+    "terms_and_privacy": "accept"
+  }
+}
