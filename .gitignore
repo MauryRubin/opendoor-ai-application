@@ -3,6 +3,5 @@ venv/
 applicant.json
 __pycache__/
 *.pyc
-output/
 .DS_Store
-opendoor-ai-application/
+.chrome-cdp-debug/

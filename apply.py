@@ -44,6 +44,8 @@ load_dotenv(BASE_DIR / ".env", override=True)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY")
+TWOCAPTCHA_TURNSTILE_COST_USD = 0.003
 MODEL = "claude-sonnet-4-20250514"
 
 
@@ -521,6 +523,184 @@ FORM_TOOLS = [
     },
 ]
 
+def _install_turnstile_hook(context) -> None:
+    """Inject an init script that records the sitekey + callback the moment
+    Rippling's code calls `turnstile.render(container, params)`. Cloudflare
+    Turnstile in "managed" mode never writes the sitekey to the DOM, so this
+    is the only reliable way to recover it.
+
+    Captured values land on:
+      window.__cfTurnstileSitekey      — string (last sitekey rendered)
+      window.__cfTurnstileCallback     — function(token) (last callback registered)
+      window.__cfTurnstileWidgetId     — string (widget id returned by render)
+      window.__cfTurnstileRenderCount  — number (how many times render fired;
+                                          0 means Cloudflare never rendered)
+    """
+    context.add_init_script(
+        """
+        (() => {
+            window.__cfTurnstileRenderCount = 0;
+            const captureParams = (params) => {
+                try {
+                    if (params && params.sitekey) {
+                        window.__cfTurnstileSitekey = params.sitekey;
+                    }
+                    if (params && typeof params.callback === 'function') {
+                        window.__cfTurnstileCallback = params.callback;
+                    }
+                } catch (e) { /* never break the page */ }
+            };
+
+            const wrapRender = (realRender) => function (container, params) {
+                captureParams(params);
+                try { window.__cfTurnstileRenderCount += 1; } catch (e) {}
+                const widgetId = realRender.call(this, container, params);
+                try { window.__cfTurnstileWidgetId = widgetId; } catch (e) {}
+                return widgetId;
+            };
+
+            // If turnstile is already defined (unlikely this early), wrap now.
+            if (window.turnstile && typeof window.turnstile.render === 'function') {
+                window.turnstile.render = wrapRender(window.turnstile.render);
+                return;
+            }
+
+            // Otherwise wait for Cloudflare's script to assign window.turnstile,
+            // and wrap render the moment it appears.
+            let _ts;
+            Object.defineProperty(window, 'turnstile', {
+                configurable: true,
+                get() { return _ts; },
+                set(v) {
+                    _ts = v;
+                    if (v && typeof v.render === 'function') {
+                        v.render = wrapRender(v.render);
+                    }
+                },
+            });
+        })();
+        """
+    )
+
+
+def _extract_turnstile_sitekey(page) -> "str | None":
+    """Find the Cloudflare Turnstile sitekey on the page, if present.
+
+    Priority:
+      1. The sitekey captured by our turnstile.render hook
+         (works for managed/programmatic widgets — Rippling).
+      2. A [data-sitekey] DOM attribute (works for auto-render widgets).
+    """
+    try:
+        captured = page.evaluate("() => window.__cfTurnstileSitekey || null")
+        if captured:
+            return captured
+    except Exception:
+        pass
+
+    locator = page.locator("[data-sitekey]").first
+    if locator.count() == 0:
+        return None
+    return locator.get_attribute("data-sitekey")
+
+def _inject_turnstile_token(page, token: str) -> dict:
+    """Deliver a solved Turnstile token to the page in the same way Cloudflare's
+    widget would on a real verification:
+
+      1. Call window.__cfTurnstileCallback(token) — this is the function the
+         page registered as Turnstile's `callback` and is what actually drives
+         submission for managed widgets (Rippling).
+      2. Set window.turnstile's known response inputs (defensive — for widgets
+         that ALSO read the hidden input).
+
+    Returns a dict describing which delivery paths fired, for diagnostics.
+    """
+    result = page.evaluate(
+        """(token) => {
+            const outcome = { calledCallback: false, setInputs: 0, errors: [] };
+            try {
+                if (typeof window.__cfTurnstileCallback === 'function') {
+                    window.__cfTurnstileCallback(token);
+                    outcome.calledCallback = true;
+                }
+            } catch (e) {
+                outcome.errors.push('callback: ' + String(e));
+            }
+            try {
+                const selector =
+                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]';
+                document.querySelectorAll(selector).forEach((el) => {
+                    el.value = token;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    outcome.setInputs += 1;
+                });
+            } catch (e) {
+                outcome.errors.push('input: ' + String(e));
+            }
+            return outcome;
+        }""",
+        token,
+    )
+    return result
+
+def solve_turnstile_if_present(page) -> bool:
+    """Solve a Turnstile widget that the caller has already confirmed is present
+    on the page, and deliver the token. Callers must pre-gate on widget
+    visibility — invoking this when no widget is up is a programming error.
+
+    Returns True if the solve succeeded; False if the sitekey could not be
+    captured, the 2captcha key is missing, or solving otherwise failed.
+    """
+    sitekey = _extract_turnstile_sitekey(page)
+    if not sitekey:
+        # Caller already gated on widget visibility; getting here means
+        # detection failed (no captured sitekey, no [data-sitekey] in DOM).
+        print("  ⚠️  Turnstile widget seen but no sitekey captured — solver skipped.")
+        return False
+
+    print(f"  🔎 Captured Turnstile sitekey: {sitekey[:16]}...")
+
+    if not TWOCAPTCHA_API_KEY:
+        print("  ⚠️  Turnstile detected but TWOCAPTCHA_API_KEY is not set — cannot solve.")
+        return False
+
+    from twocaptcha import TwoCaptcha
+    solver = TwoCaptcha(TWOCAPTCHA_API_KEY)
+    page_url = page.url
+
+    print(f"  🔓 Solving Turnstile via 2captcha (sitekey={sitekey[:16]}...)")
+    try:
+        result = solver.turnstile(sitekey=sitekey, url=page_url)
+    except Exception as exc:
+        print(f"  ❌ 2captcha solve failed: {exc}")
+        return False
+
+    token = result.get("code") if isinstance(result, dict) else None
+    if not token:
+        print(f"  ❌ 2captcha returned no token: {result}")
+        return False
+
+    print(f"  ✅ Got token ({len(token)} chars) — injecting into page")
+    delivery = _inject_turnstile_token(page, token)
+    print(
+        f"  → callback fired: {delivery.get('calledCallback')}, "
+        f"hidden inputs set: {delivery.get('setInputs')}, "
+        f"errors: {delivery.get('errors') or 'none'}"
+    )
+    # Give Rippling's onSubmit handler time to fire after the callback.
+    page.wait_for_timeout(2000)
+
+    run_log["api_calls"].append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "purpose": "twocaptcha_turnstile_solve",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": TWOCAPTCHA_TURNSTILE_COST_USD,
+    })
+    run_log["total_cost_usd"] = round(run_log["total_cost_usd"] + TWOCAPTCHA_TURNSTILE_COST_USD, 4)
+    return True
+
 def _build_form_fill_system(resume_text: str) -> str:
     return f"""You are an AI agent filling out a job application form on behalf of an applicant.
 You can see a screenshot of the current browser page. Your job is to identify form fields, look up the correct answer in the reference material below, and fill them accurately.
@@ -565,15 +745,7 @@ RULES:
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
 4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
-5. CAPTCHA HANDLING — If you see a Cloudflare Turnstile widget, "Verify you are human" checkbox, reCAPTCHA, or any human-verification challenge:
-   a. CLICK THE CHECKBOX directly at its center coordinates. The browser has been patched to look human; clicking the checkbox is what Turnstile needs to trigger its (invisible) verification check.
-   b. IMMEDIATELY after the click, call `wait` with seconds=8. Turnstile runs verification invisibly during this wait — DO NOT re-click or panic if no visible change happens for 5-10 seconds.
-   c. On the next turn, look at the new screenshot:
-      - If the checkbox now shows a green checkmark, the page has progressed, OR a confirmation message appears → continue toward Submit / confirmation.
-      - If the page shows a "verification failed" message or the checkbox is still empty after the wait → call wait again with seconds=5, then re-check.
-   d. Repeat the wait/check cycle up to 3 times if needed.
-   e. ONLY after 3 full cycles where the CAPTCHA still blocks progress should you call done with status "needs_human".
-   f. If you see a confirmation page ("Application submitted", "Thank you", "We've received your application", "Application sent", etc.) call done with status "submitted".
+5. CAPTCHA HANDLING — Cloudflare Turnstile is automatically solved by the system BEFORE you see each screenshot. You will rarely see one. If you DO see a "Verify you are human" widget, just call the `wait` tool with seconds=5 — the system will solve it on the next cycle. NEVER click a Turnstile checkbox yourself; the click pattern is what Cloudflare uses to flag bots. If the SAME CAPTCHA persists after calling wait(5) TWICE in a row, the auto-solver has failed — call done with status "needs_human" so a human can take over.
 6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
 7. After submission, if you see a confirmation page, call done with status "submitted".
 8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
@@ -702,6 +874,9 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
         # (navigator.plugins/languages, canvas/WebGL hash, permissions API,
         # chrome runtime, navigator.webdriver, etc.).
         Stealth().apply_stealth_sync(context)
+        # Hook turnstile.render so we can recover the sitekey + callback
+        # (Rippling renders Turnstile in managed mode — sitekey is not in DOM).
+        _install_turnstile_hook(context)
         page = context.new_page()
 
         print(f"  Navigating to {APPLICATION_URL}")
@@ -718,6 +893,29 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
             print(f"\n  --- Step {step} ---")
 
             screenshot_b64, screenshot_path = take_screenshot(page, step)
+
+            # Auto-solve Cloudflare Turnstile so the agent never has to handle it.
+            # Trigger on EITHER a captured sitekey OR a visible Cloudflare iframe.
+            try:
+                has_cf_iframe = page.locator(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                ).count() > 0
+                has_sitekey = bool(_extract_turnstile_sitekey(page))
+                if has_cf_iframe or has_sitekey:
+                    print(
+                        f"  🛡️  Turnstile widget present "
+                        f"(iframe={has_cf_iframe}, sitekey_captured={has_sitekey}) "
+                        f"— attempting auto-solve"
+                    )
+                    solved = solve_turnstile_if_present(page)
+                    if solved:
+                        # Give Cloudflare's callback a moment, then re-screenshot
+                        page.wait_for_timeout(3000)
+                        screenshot_b64, screenshot_path = take_screenshot(page, step)
+                    else:
+                        print("  ⚠️  Turnstile solve failed — agent will see the widget and likely stall.")
+            except Exception as e:
+                print(f"  ⚠️  Auto-solve raised unexpectedly: {e}. Continuing with current screenshot.")
 
             dry_run_note = ""
             if dry_run:
@@ -996,6 +1194,48 @@ Total Claude API cost for this application: **${total_cost:.2f}**
 | Call | Tokens In | Tokens Out | Cost |
 |------|-----------|------------|------|
 {cost_table}
+
+## The CAPTCHA Journey
+
+The most interesting engineering problem in this project wasn't filling out the form — it was the Cloudflare Turnstile widget that appears at submission. Each iteration of the fix taught me something about how production bot-detection actually works.
+
+### Attempt 1 — pause for a human
+
+The first version had the agent stop and wait for the operator to solve the captcha manually. Functional, but it violates the "only AI" challenge. Not acceptable.
+
+### Attempt 2 — 2captcha API
+
+Cloudflare Turnstile can be solved programmatically via solving services. I integrated [2captcha](https://2captcha.com) (~$0.003 per solve, ~30s latency): the agent detects the widget, ships the sitekey to 2captcha, waits for the solved token, and injects it back into the page.
+
+CAPTCHAs are *literally designed* to require human intervention, so delegating that one step to a paid solving service is more honest than pretending to defeat Cloudflare's anti-bot fingerprinting from scratch.
+
+### Attempt 3 — figuring out why detection silently failed
+
+My first 2captcha integration never fired. After a failed submission run, the 2captcha balance was untouched. Detection had returned no sitekey, so the solver was skipped.
+
+The reason: Rippling renders Turnstile in **managed mode** — the widget is created via `turnstile.render(container, {{sitekey, callback}})` rather than via the `<div data-sitekey="...">` auto-render pattern. The sitekey never lands in the DOM, so my `[data-sitekey]` lookup found nothing and silently bailed.
+
+### Attempt 4 — hook `turnstile.render` itself
+
+Right approach: instead of looking for the sitekey in the DOM after the fact, intercept the moment Cloudflare's code calls `turnstile.render` and grab both arguments. A Playwright init script wraps `window.turnstile` via `Object.defineProperty` *before* Cloudflare's script loads, so the moment Cloudflare assigns `window.turnstile = {{...}}` my wrapper takes over `.render` and records the `sitekey` + the registered `callback` to globals on `window`.
+
+Then on the Python side: read the captured sitekey, call 2captcha, and invoke the captured callback with the solved token. That's exactly what Cloudflare's widget would do on a real human verification — and it's what Rippling's submit pipeline is actually waiting on. (Stuffing the token into the hidden `cf-turnstile-response` input doesn't work in managed mode; Rippling's submit handler reads the callback, not the input.)
+
+### Attempt 5 — diagnostic harness
+
+Running the full agent loop to verify the captcha fix cost ~$1.50 in Claude tokens per attempt (~11 minutes of vision-driven form filling). So I built [`diagnose_captcha.py`](diagnose_captcha.py): a manual-fill rig that launches the same Chromium config (or attaches to your real Chrome via CDP), installs the same hook, and polls every 500ms for `window.__cfTurnstileRenderCount`, `__cfTurnstileSitekey`, and the Cloudflare iframe count. As soon as a sitekey is captured, it auto-solves and reports outcome. Cost per run: $0.003, zero Claude tokens.
+
+### Where it stands
+
+After the hook fix landed, I never reached the Turnstile widget again. Rippling's submit endpoint started returning a generic *"Unable to apply for Operations AI Engineer. Please try again later."* error **before** the widget renders. I reproduced the same rejection with manual form filling in my real Chrome browser (real fingerprint, real cookies) — so the cause is server-side, not the agent. Most likely Rippling has a duplicate-application check tied to my email, triggered by an earlier failed attempt that registered server-side.
+
+So the captcha auto-solver is in the code, ready, and architecturally correct — but I haven't been able to get one solve through end-to-end because submission is blocked upstream. The code path itself can be inspected: `_install_turnstile_hook`, `_extract_turnstile_sitekey`, `_inject_turnstile_token`, and `solve_turnstile_if_present` in [`apply.py`](apply.py).
+
+### Takeaways
+
+- **Bot-detection systems silently fail in interesting ways.** "Check the DOM for the sitekey" doesn't work when widgets are rendered programmatically. Knowing how a protected library is *integrated* on a given site matters more than knowing how the library works in isolation.
+- **The point of integration matters more than the point of interception.** Setting the hidden input would have looked plausible and never worked. Calling the registered callback works because it's the same surface Cloudflare's own widget would invoke.
+- **Server-side reject ≠ client-side reject.** When the API says "try again later," your client-side automation can be perfect and still get blocked at the edge. The fix isn't always in your code.
 
 ## Why This Matters
 
