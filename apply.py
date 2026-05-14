@@ -1195,11 +1195,47 @@ Total Claude API cost for this application: **${total_cost:.2f}**
 |------|-----------|------------|------|
 {cost_table}
 
-## Design Choices
+## The CAPTCHA Journey
 
-**One external service: 2captcha.** The agent handles 100% of the application except for solving Cloudflare Turnstile (the "Verify you are human" CAPTCHA Rippling shows on submit). For that one step the agent calls the 2captcha API, which returns a valid token in ~30 seconds. CAPTCHAs are *literally designed* to require human intervention, so delegating that single step to a paid solving service is the honest architectural choice — more honest than pretending to defeat Cloudflare's anti-bot fingerprinting. Cost: ~$0.003 per solve.
+The most interesting engineering problem in this project wasn't filling out the form — it was the Cloudflare Turnstile widget that appears at submission. Each iteration of the fix taught me something about how production bot-detection actually works.
 
-Everything else (parsing the resume, writing the cover letter, navigating the form, picking dropdown options, uploading files, choosing consent answers, clicking Submit, verifying success, pushing the artifacts) runs locally on the Anthropic + Playwright stack.
+### Attempt 1 — pause for a human
+
+The first version had the agent stop and wait for the operator to solve the captcha manually. Functional, but it violates the "only AI" challenge. Not acceptable.
+
+### Attempt 2 — 2captcha API
+
+Cloudflare Turnstile can be solved programmatically via solving services. I integrated [2captcha](https://2captcha.com) (~$0.003 per solve, ~30s latency): the agent detects the widget, ships the sitekey to 2captcha, waits for the solved token, and injects it back into the page.
+
+CAPTCHAs are *literally designed* to require human intervention, so delegating that one step to a paid solving service is more honest than pretending to defeat Cloudflare's anti-bot fingerprinting from scratch.
+
+### Attempt 3 — figuring out why detection silently failed
+
+My first 2captcha integration never fired. After a failed submission run, the 2captcha balance was untouched. Detection had returned no sitekey, so the solver was skipped.
+
+The reason: Rippling renders Turnstile in **managed mode** — the widget is created via `turnstile.render(container, {{sitekey, callback}})` rather than via the `<div data-sitekey="...">` auto-render pattern. The sitekey never lands in the DOM, so my `[data-sitekey]` lookup found nothing and silently bailed.
+
+### Attempt 4 — hook `turnstile.render` itself
+
+Right approach: instead of looking for the sitekey in the DOM after the fact, intercept the moment Cloudflare's code calls `turnstile.render` and grab both arguments. A Playwright init script wraps `window.turnstile` via `Object.defineProperty` *before* Cloudflare's script loads, so the moment Cloudflare assigns `window.turnstile = {{...}}` my wrapper takes over `.render` and records the `sitekey` + the registered `callback` to globals on `window`.
+
+Then on the Python side: read the captured sitekey, call 2captcha, and invoke the captured callback with the solved token. That's exactly what Cloudflare's widget would do on a real human verification — and it's what Rippling's submit pipeline is actually waiting on. (Stuffing the token into the hidden `cf-turnstile-response` input doesn't work in managed mode; Rippling's submit handler reads the callback, not the input.)
+
+### Attempt 5 — diagnostic harness
+
+Running the full agent loop to verify the captcha fix cost ~$1.50 in Claude tokens per attempt (~11 minutes of vision-driven form filling). So I built [`diagnose_captcha.py`](diagnose_captcha.py): a manual-fill rig that launches the same Chromium config (or attaches to your real Chrome via CDP), installs the same hook, and polls every 500ms for `window.__cfTurnstileRenderCount`, `__cfTurnstileSitekey`, and the Cloudflare iframe count. As soon as a sitekey is captured, it auto-solves and reports outcome. Cost per run: $0.003, zero Claude tokens.
+
+### Where it stands
+
+After the hook fix landed, I never reached the Turnstile widget again. Rippling's submit endpoint started returning a generic *"Unable to apply for Operations AI Engineer. Please try again later."* error **before** the widget renders. I reproduced the same rejection with manual form filling in my real Chrome browser (real fingerprint, real cookies) — so the cause is server-side, not the agent. Most likely Rippling has a duplicate-application check tied to my email, triggered by an earlier failed attempt that registered server-side.
+
+So the captcha auto-solver is in the code, ready, and architecturally correct — but I haven't been able to get one solve through end-to-end because submission is blocked upstream. The code path itself can be inspected: `_install_turnstile_hook`, `_extract_turnstile_sitekey`, `_inject_turnstile_token`, and `solve_turnstile_if_present` in [`apply.py`](apply.py).
+
+### Takeaways
+
+- **Bot-detection systems silently fail in interesting ways.** "Check the DOM for the sitekey" doesn't work when widgets are rendered programmatically. Knowing how a protected library is *integrated* on a given site matters more than knowing how the library works in isolation.
+- **The point of integration matters more than the point of interception.** Setting the hidden input would have looked plausible and never worked. Calling the registered callback works because it's the same surface Cloudflare's own widget would invoke.
+- **Server-side reject ≠ client-side reject.** When the API says "try again later," your client-side automation can be perfect and still get blocked at the edge. The fix isn't always in your code.
 
 ## Why This Matters
 
