@@ -530,13 +530,16 @@ def _install_turnstile_hook(context) -> None:
     is the only reliable way to recover it.
 
     Captured values land on:
-      window.__cfTurnstileSitekey   — string (last sitekey rendered)
-      window.__cfTurnstileCallback  — function(token) (last callback registered)
-      window.__cfTurnstileWidgetId  — string (widget id returned by render)
+      window.__cfTurnstileSitekey      — string (last sitekey rendered)
+      window.__cfTurnstileCallback     — function(token) (last callback registered)
+      window.__cfTurnstileWidgetId     — string (widget id returned by render)
+      window.__cfTurnstileRenderCount  — number (how many times render fired;
+                                          0 means Cloudflare never rendered)
     """
     context.add_init_script(
         """
         (() => {
+            window.__cfTurnstileRenderCount = 0;
             const captureParams = (params) => {
                 try {
                     if (params && params.sitekey) {
@@ -550,6 +553,7 @@ def _install_turnstile_hook(context) -> None:
 
             const wrapRender = (realRender) => function (container, params) {
                 captureParams(params);
+                try { window.__cfTurnstileRenderCount += 1; } catch (e) {}
                 const widgetId = realRender.call(this, container, params);
                 try { window.__cfTurnstileWidgetId = widgetId; } catch (e) {}
                 return widgetId;
