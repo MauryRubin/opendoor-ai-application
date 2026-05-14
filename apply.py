@@ -580,7 +580,20 @@ def _install_turnstile_hook(context) -> None:
 
 
 def _extract_turnstile_sitekey(page) -> "str | None":
-    """Find the Cloudflare Turnstile sitekey on the page, if present."""
+    """Find the Cloudflare Turnstile sitekey on the page, if present.
+
+    Priority:
+      1. The sitekey captured by our turnstile.render hook
+         (works for managed/programmatic widgets — Rippling).
+      2. A [data-sitekey] DOM attribute (works for auto-render widgets).
+    """
+    try:
+        captured = page.evaluate("() => window.__cfTurnstileSitekey || null")
+        if captured:
+            return captured
+    except Exception:
+        pass
+
     locator = page.locator("[data-sitekey]").first
     if locator.count() == 0:
         return None
