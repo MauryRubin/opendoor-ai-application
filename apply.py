@@ -45,6 +45,7 @@ load_dotenv(BASE_DIR / ".env", override=True)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY")
+TWOCAPTCHA_TURNSTILE_COST_USD = 0.003
 MODEL = "claude-sonnet-4-20250514"
 
 
@@ -581,9 +582,9 @@ def solve_turnstile_if_present(page) -> bool:
         "purpose": "twocaptcha_turnstile_solve",
         "input_tokens": 0,
         "output_tokens": 0,
-        "cost_usd": 0.003,
+        "cost_usd": TWOCAPTCHA_TURNSTILE_COST_USD,
     })
-    run_log["total_cost_usd"] = round(run_log["total_cost_usd"] + 0.003, 4)
+    run_log["total_cost_usd"] = round(run_log["total_cost_usd"] + TWOCAPTCHA_TURNSTILE_COST_USD, 4)
     return True
 
 def _build_form_fill_system(resume_text: str) -> str:
