@@ -631,15 +631,7 @@ RULES:
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
 4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
-5. CAPTCHA HANDLING — If you see a Cloudflare Turnstile widget, "Verify you are human" checkbox, reCAPTCHA, or any human-verification challenge:
-   a. CLICK THE CHECKBOX directly at its center coordinates. The browser has been patched to look human; clicking the checkbox is what Turnstile needs to trigger its (invisible) verification check.
-   b. IMMEDIATELY after the click, call `wait` with seconds=8. Turnstile runs verification invisibly during this wait — DO NOT re-click or panic if no visible change happens for 5-10 seconds.
-   c. On the next turn, look at the new screenshot:
-      - If the checkbox now shows a green checkmark, the page has progressed, OR a confirmation message appears → continue toward Submit / confirmation.
-      - If the page shows a "verification failed" message or the checkbox is still empty after the wait → call wait again with seconds=5, then re-check.
-   d. Repeat the wait/check cycle up to 3 times if needed.
-   e. ONLY after 3 full cycles where the CAPTCHA still blocks progress should you call done with status "needs_human".
-   f. If you see a confirmation page ("Application submitted", "Thank you", "We've received your application", "Application sent", etc.) call done with status "submitted".
+5. CAPTCHA HANDLING — Cloudflare Turnstile is automatically solved by the system BEFORE you see each screenshot. You will rarely see one. If you DO see a "Verify you are human" widget, just call the `wait` tool with seconds=5 — the system will solve it on the next cycle. NEVER click a Turnstile checkbox yourself; the click pattern is what Cloudflare uses to flag bots.
 6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
 7. After submission, if you see a confirmation page, call done with status "submitted".
 8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
