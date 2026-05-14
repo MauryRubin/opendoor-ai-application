@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-AI Job Application Agent for Opendoor
-======================================
-This script autonomously applies to the Opendoor Operations AI Engineer role.
-It parses a resume, generates a cover letter, fills the Rippling ATS form
-using Claude's vision API, and documents the entire process.
+AI Job Application Agent
+========================
+This script autonomously applies to a job posting configured in job.json.
+It parses a resume, generates a cover letter, fills the ATS form using
+Claude's vision API, and documents the entire process in a public GitHub repo.
+
+Applicant details come from applicant.json (gitignored). Job details and
+narrative framing come from job.json.
 
 Usage:
     python apply.py --dry-run    # Fill form without submitting
@@ -15,6 +18,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -28,26 +32,53 @@ from dotenv import load_dotenv
 from fpdf import FPDF
 from PIL import Image
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-load_dotenv(Path(__file__).parent / ".env", override=True)
+BASE_DIR = Path(__file__).parent
+
+load_dotenv(BASE_DIR / ".env", override=True)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 MODEL = "claude-sonnet-4-20250514"
-APPLICATION_URL = (
-    "https://ats.rippling.com/en-CA/opendoor/jobs/"
-    "f572e889-0644-4590-8a5a-64f73d7db17d/apply"
-)
-REPO_NAME = "opendoor-ai-application"
-GITHUB_USERNAME = "MauryRubin"
-REPO_URL = f"https://github.com/{GITHUB_USERNAME}/{REPO_NAME}"
 
-BASE_DIR = Path(__file__).parent
-RESUME_PATH = BASE_DIR / "Maury_Rubin_Resume.pdf"
+
+def _load_json_config(path: Path, hint: str) -> dict:
+    if not path.exists():
+        sys.stderr.write(
+            f"ERROR: {path.name} not found at {path}.\n{hint}\n"
+        )
+        sys.exit(1)
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"ERROR: {path.name} is not valid JSON: {exc}\n")
+        sys.exit(1)
+
+
+APPLICANT = _load_json_config(
+    BASE_DIR / "applicant.json",
+    "Copy applicant.example.json to applicant.json and fill in your details.",
+)
+JOB = _load_json_config(
+    BASE_DIR / "job.json",
+    "Create job.json describing the role you are applying to "
+    "(see README for the schema).",
+)
+
+GITHUB_USERNAME = APPLICANT["github_username"]
+REPO_NAME = JOB["repo_name"]
+REPO_URL = f"https://github.com/{GITHUB_USERNAME}/{REPO_NAME}"
+APPLICATION_URL = JOB["application_url"]
+
+APPLICANT.setdefault("github", f"https://github.com/{GITHUB_USERNAME}")
+APPLICANT.setdefault("portfolio", REPO_URL)
+
+RESUME_PATH = BASE_DIR / APPLICANT["resume_filename"]
 OUTPUT_DIR = BASE_DIR / "output"
 SCREENSHOTS_DIR = OUTPUT_DIR / "screenshots"
 COVER_LETTER_PATH = OUTPUT_DIR / "cover_letter.pdf"
@@ -55,26 +86,6 @@ GIF_PATH = OUTPUT_DIR / "application_recording.gif"
 LOG_PATH = OUTPUT_DIR / "run_log.json"
 
 VIEWPORT = {"width": 1280, "height": 900}
-
-APPLICANT = {
-    "name": "Maury Daniel Rubin",
-    "first_name": "Maury",
-    "last_name": "Rubin",
-    "email": "maurydr1@gmail.com",
-    "phone": "(647) 287-3417",
-    "address": "61 Collinson Blvd",
-    "city": "Toronto",
-    "province": "Ontario",
-    "country": "Canada",
-    "postal_code": "",
-    "linkedin": "https://www.linkedin.com/in/mauryrubin/",
-    "github": f"https://github.com/{GITHUB_USERNAME}",
-    "portfolio": REPO_URL,
-    "current_role": "Product Manager Director",
-    "current_company": "Wave Financial",
-    "work_authorization": "Canadian citizen",
-    "requires_sponsorship": "No",
-}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -159,7 +170,10 @@ def bootstrap_github_repo():
     except GithubException:
         repo = user.create_repo(
             REPO_NAME,
-            description="I applied to Opendoor using only AI. This repo documents the process.",
+            description=(
+                f"I applied to {JOB['company']} using only AI. "
+                "This repo documents the process."
+            ),
             auto_init=False,
         )
         print(f"  Created repo: {REPO_URL}")
@@ -209,66 +223,50 @@ def bootstrap_github_repo():
 # Phase 3: Cover Letter Generation
 # ---------------------------------------------------------------------------
 
-JOB_DESCRIPTION = """
-Operations AI Engineer at Opendoor (Toronto)
-
-Key Responsibilities:
-- Transform ambiguous business challenges into system designs and implementation roadmaps
-- Prototype and deploy rapid experiments to improve operational workflows
-- Build AI-powered internal tools and automation systems
-- Evaluate build versus integrate decisions for AI tooling
-- Establish monitoring for model performance, latency, and drift detection
-- Conduct troubleshooting and root cause analysis for production issues
-- Partner with data scientists to operationalize machine learning models
-
-Required Qualifications:
-- 5+ years of experience in operations and data
-- SQL proficiency, API integration, LLM deployment understanding
-- Machine learning lifecycle concepts
-- High agency, systems thinking, strong communication
-
-Desired Skills:
-- AI coding assistants (Claude, Cursor)
-- Workflow automation platforms (Gumloop, Zapier)
-- Data platforms (Snowflake, Databricks)
-- Agentic AI frameworks and automation flows
-"""
-
 
 def generate_cover_letter(client: anthropic.Anthropic, resume_text: str) -> str:
     print("\n✉️  Phase 3: Generating cover letter...")
 
-    prompt = f"""Write a cover letter for Maury Daniel Rubin applying to the Operations AI Engineer role at Opendoor in Toronto.
+    company = JOB["company"]
+    role = JOB["role_title"]
+    location = JOB["location"]
+    challenger = JOB.get("challenger_title", "hiring team")
+    greeting = JOB.get("hiring_team_greeting", f"Dear {company} Hiring Team,")
+    narrative_hook = JOB.get(
+        "narrative_hook",
+        f"{company}'s {challenger} challenged applicants to apply to the {role} "
+        "role using only AI for a chance to skip to the final round",
+    )
 
-CRITICAL CONTEXT: This cover letter is being generated by an AI agent that Maury built. The same agent that writes this letter also:
-- Parsed his resume from a PDF
+    prompt = f"""Write a cover letter for {APPLICANT['name']} applying to the {role} role at {company} in {location}.
+
+CRITICAL CONTEXT: This cover letter is being generated by an AI agent that the applicant built. The same agent that writes this letter also:
+- Parsed the resume from a PDF
 - Created a GitHub repository to document the process
-- Will fill out the Rippling ATS application form using Claude's vision API
+- Will fill out the ATS application form using Claude's vision API
 - Will record the entire process as a GIF
+
+NARRATIVE HOOK (the reason this AI-driven application is appropriate):
+{narrative_hook}
 
 The GitHub repo documenting this process is at: {REPO_URL}
 
 JOB DESCRIPTION:
-{JOB_DESCRIPTION}
+{JOB['job_description']}
 
-RESUME TEXT:
+RESUME TEXT (this is your source of truth for the applicant's background — do NOT invent facts not present here):
 {resume_text}
 
 INSTRUCTIONS:
-1. Open with a hook that acknowledges the meta-nature — this letter was written by AI, as challenged by the founder. Keep it confident, not gimmicky.
-2. Highlight why Maury fits:
-   - API & integrations leadership at Wave Financial (built the integration marketplace, monetized the API)
-   - Techstars Proptech Accelerator experience (real estate tech → Opendoor connection)
-   - Multi-country market launches at Clearco (operational scaling across Toronto, UK, Australia)
-   - Payments/fintech operational complexity at scale
-   - Master of Financial Economics + CFA Level II = analytical rigor
+1. Open with a hook that acknowledges the meta-nature — this letter was written by AI, as challenged by the {challenger}. Keep it confident, not gimmicky.
+2. Highlight why the applicant fits the role. Pull specific evidence (companies, accomplishments, credentials) ONLY from the resume text above. Do not fabricate.
 3. Connect the application itself to the role: this agent IS an AI-powered operational workflow — it handles ambiguity (unknown form fields), integrates multiple APIs, and produces auditable output.
 4. Include the GitHub repo link naturally.
 5. Close with confidence — forward-looking, not begging.
 
-TONE: Professional, slightly playful, self-aware. The reader is the Opendoor hiring team who explicitly invited this approach.
+TONE: Professional, slightly playful, self-aware. The reader is the {company} hiring team who explicitly invited this approach.
 
-FORMAT: Plain text paragraphs. No bullet points. Keep it under 400 words. Do not include a header/address block — just the body text starting with "Dear Opendoor Hiring Team,".
+FORMAT: Plain text paragraphs. No bullet points. Keep it under 400 words. Do not include a header/address block — just the body text starting with "{greeting}".
 """
 
     response = client.messages.create(
@@ -288,33 +286,91 @@ FORMAT: Plain text paragraphs. No bullet points. Keep it under 400 words. Do not
     return letter_text
 
 
+def _latin1_safe(text: str) -> str:
+    replacements = {
+        "—": "--",
+        "–": "-",
+        "‘": "'",
+        "’": "'",
+        "“": '"',
+        "”": '"',
+        "…": "...",
+        " ": " ",
+        "•": "*",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+_URL_PATTERN = re.compile(r"(https?://[^\s)]+)")
+
+
+_URL_TRAIL_PUNCT = ".,;:!?\"')]}>"
+
+
+def _split_url_and_trailing(raw: str) -> tuple[str, str]:
+    """Strip trailing punctuation / em-dash from URL; return (url, trailing)."""
+    trailing = ""
+    while raw and raw[-1] in _URL_TRAIL_PUNCT:
+        trailing = raw[-1] + trailing
+        raw = raw[:-1]
+    if raw.endswith("--"):
+        trailing = "--" + trailing
+        raw = raw[:-2]
+    return raw, trailing
+
+
+def _write_paragraph_with_links(pdf, paragraph: str, line_height: float = 6.0):
+    """Render a paragraph with auto-wrap, turning URLs into clickable blue links."""
+    parts = _URL_PATTERN.split(paragraph)
+    for part in parts:
+        if not part:
+            continue
+        if _URL_PATTERN.match(part):
+            url, trailing = _split_url_and_trailing(part)
+            pdf.set_text_color(0, 0, 200)
+            pdf.set_font("Helvetica", "U", size=11)
+            pdf.write(line_height, url, link=url)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", size=11)
+            if trailing:
+                pdf.write(line_height, trailing)
+        else:
+            pdf.write(line_height, part)
+    pdf.ln(line_height + 4)
+
+
 def render_cover_letter_pdf(letter_text: str):
     print("  Rendering cover letter to PDF...")
+    letter_text = _latin1_safe(letter_text)
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=25)
     pdf.set_font("Helvetica", size=11)
 
+    header_name = _latin1_safe(APPLICANT["name"])
+    header_meta_parts = [APPLICANT.get("email", ""), APPLICANT.get("phone", "")]
+    city = APPLICANT.get("city", "")
+    province = APPLICANT.get("province", "")
+    if city and province:
+        header_meta_parts.append(f"{city}, {province}")
+    elif city:
+        header_meta_parts.append(city)
+    header_meta = _latin1_safe(" | ".join(p for p in header_meta_parts if p))
+
     pdf.set_font("Helvetica", "B", size=14)
-    pdf.cell(0, 10, "Maury Daniel Rubin", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 10, header_name, new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_font("Helvetica", size=9)
-    pdf.cell(
-        0,
-        5,
-        "maurydr1@gmail.com | (647) 287-3417 | Toronto, ON",
-        new_x="LMARGIN",
-        new_y="NEXT",
-        align="C",
-    )
+    pdf.cell(0, 5, header_meta, new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(10)
 
-    pdf.set_font("Helvetica", size=11)
+    pdf.set_font("Helvetica", "", size=11)
     for paragraph in letter_text.split("\n\n"):
         paragraph = paragraph.strip()
         if not paragraph:
             continue
-        pdf.multi_cell(0, 6, paragraph)
-        pdf.ln(4)
+        _write_paragraph_with_links(pdf, paragraph)
 
     pdf.output(str(COVER_LETTER_PATH))
     print(f"  Saved to {COVER_LETTER_PATH}")
@@ -465,38 +521,74 @@ FORM_TOOLS = [
     },
 ]
 
-FORM_FILL_SYSTEM = f"""You are an AI agent filling out a job application form on behalf of Maury Daniel Rubin.
-You can see a screenshot of the current browser page. Your job is to identify form fields and fill them accurately.
+def _extract_turnstile_sitekey(page) -> "str | None":
+    """Find the Cloudflare Turnstile sitekey on the page, if present."""
+    locator = page.locator("[data-sitekey]").first
+    if locator.count() == 0:
+        return None
+    return locator.get_attribute("data-sitekey")
 
-APPLICANT INFORMATION:
-- Full Name: {APPLICANT['name']}
-- First Name: {APPLICANT['first_name']}
-- Last Name: {APPLICANT['last_name']}
-- Email: {APPLICANT['email']}
-- Phone: {APPLICANT['phone']}
-- Address: {APPLICANT['address']}, {APPLICANT['city']}, {APPLICANT['province']}, {APPLICANT['country']}
-- LinkedIn: {APPLICANT['linkedin']}
-- GitHub / Portfolio: {APPLICANT['portfolio']}
-- Current Role: {APPLICANT['current_role']} at {APPLICANT['current_company']}
-- Work Authorization: {APPLICANT['work_authorization']} (does NOT require sponsorship)
+def _build_form_fill_system(resume_text: str) -> str:
+    return f"""You are an AI agent filling out a job application form on behalf of an applicant.
+You can see a screenshot of the current browser page. Your job is to identify form fields, look up the correct answer in the reference material below, and fill them accurately.
 
-FILES AVAILABLE FOR UPLOAD:
-- Resume: Maury_Rubin_Resume.pdf
-- Cover Letter: cover_letter.pdf
+APPLICANT REFERENCE DATA (JSON — your primary source for basic identity fields like name, email, phone, address, work authorization, current role):
+{json.dumps(APPLICANT, indent=2)}
+
+RESUME TEXT (your source of truth for work history, education, skills, accomplishments, and any field asking about background):
+{resume_text}
+
+ROLE CONTEXT:
+- Company: {JOB['company']}
+- Role: {JOB['role_title']}
+- Location: {JOB['location']}
+
+FILES AVAILABLE FOR UPLOAD (use the upload_file tool with these file_type values):
+- "resume" — the applicant's resume PDF ({APPLICANT.get('resume_filename', 'resume.pdf')})
+- "cover_letter" — the AI-generated cover letter (cover_letter.pdf)
+
+HOW TO ANSWER FIELDS:
+- For each form field, FIRST identify what it is asking for from the screenshot.
+- THEN look up the answer:
+  - Identity / contact / authorization fields → APPLICANT JSON above.
+  - Experience / education / skills / past employers / accomplishments → RESUME TEXT above.
+  - Role-targeting fields (e.g. "which position?") → ROLE CONTEXT above.
+  - Voluntary disclosure / EEO fields (gender, ethnicity, race, veteran status, disability status, pronouns) → use APPLICANT.eeo_responses if present, otherwise select the option closest to "Prefer not to answer" / "Decline to disclose" / "I don't wish to answer". NEVER guess these from the resume.
+  - Consent / opt-in fields (SMS updates, marketing emails, "I agree to terms", privacy policy, application status updates) → use APPLICANT.consent_responses if present, with these defaults if a specific field isn't listed:
+      * SMS / text-message updates → DECLINE / select "No" (privacy-preserving default)
+      * Marketing / promotional email → DECLINE / select "No"
+      * Application status updates → ACCEPT / select "Yes" (applicant wants to hear back)
+      * Required terms-of-service / privacy-policy / "I confirm the information is accurate" → ACCEPT / check the box (otherwise the form cannot be submitted)
+- If a field has no obvious match in any reference material, choose the safest reasonable answer from what IS present. Do NOT invent facts about the applicant that aren't in the resume or applicant data.
+- For free-form "Why this company?" or "Why this role?" boxes, draw on the resume + role context to write a brief, honest answer.
+
+FILE UPLOAD RULES (important — past runs got stuck here):
+- The form has separate inputs for resume and cover letter. Each upload_file call routes correctly based on the file_type argument.
+- Upload each file EXACTLY ONCE. Do not re-upload to "fix" what looks wrong in a screenshot — the screenshots are slow to refresh.
+- After calling upload_file once for "resume" and once for "cover_letter", consider the upload section done and MOVE ON, even if the previewed filename looks confusing. Trust the tool calls succeeded.
 
 RULES:
 1. Examine the screenshot carefully. Describe what you see before acting.
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
-4. For file uploads: click the upload button/area, then use the upload_file tool.
-5. For "How did you hear about us?" type questions: answer "Company website".
-6. For work authorization: Canadian citizen, no sponsorship needed.
-7. If you see a CAPTCHA or something blocking, call done with status "needs_human".
-8. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
-9. After submission, if you see a confirmation page, call done with status "submitted".
-10. If a field is already filled correctly, skip it.
-11. Be precise with coordinates — click the CENTER of input fields and buttons.
-12. If you need to see more of the page, use the scroll tool.
+4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
+5. CAPTCHA HANDLING — If you see a Cloudflare Turnstile widget, "Verify you are human" checkbox, reCAPTCHA, or any human-verification challenge:
+   a. CLICK THE CHECKBOX directly at its center coordinates. The browser has been patched to look human; clicking the checkbox is what Turnstile needs to trigger its (invisible) verification check.
+   b. IMMEDIATELY after the click, call `wait` with seconds=8. Turnstile runs verification invisibly during this wait — DO NOT re-click or panic if no visible change happens for 5-10 seconds.
+   c. On the next turn, look at the new screenshot:
+      - If the checkbox now shows a green checkmark, the page has progressed, OR a confirmation message appears → continue toward Submit / confirmation.
+      - If the page shows a "verification failed" message or the checkbox is still empty after the wait → call wait again with seconds=5, then re-check.
+   d. Repeat the wait/check cycle up to 3 times if needed.
+   e. ONLY after 3 full cycles where the CAPTCHA still blocks progress should you call done with status "needs_human".
+   f. If you see a confirmation page ("Application submitted", "Thank you", "We've received your application", "Application sent", etc.) call done with status "submitted".
+6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
+7. After submission, if you see a confirmation page, call done with status "submitted".
+8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
+9. Be precise with coordinates — click the CENTER of input fields and buttons.
+10. If you need to see more of the page, use the scroll tool.
+11. Make forward progress. Don't loop back to re-check fields you've already completed — fill from top to bottom and only revisit if you hit a validation error after attempting Submit.
+12. CRITICAL: Before declaring "done", scroll all the way to the bottom of the form and confirm the Submit / Apply button is ENABLED (not grayed out). A grayed-out Apply button means a required field is still unanswered — usually a consent radio, terms checkbox, or skipped dropdown further down. Find it, fill it, then verify Apply is enabled. Only THEN click Submit (or in dry-run mode, call done with status "submitted").
+13. Required radio groups (e.g. "Yes / No - I consent to receiving text messages") MUST have one option selected. If neither is selected, the form won't submit. Use the consent rules above to pick the correct option.
 """
 
 
@@ -540,9 +632,21 @@ def execute_tool(page, tool_name: str, tool_input: dict, dry_run: bool) -> str:
         )
         file_inputs = page.query_selector_all('input[type="file"]')
         if file_inputs:
-            file_inputs[-1].set_input_files(file_path)
+            # Route by file_type — most ATS forms list resume first, cover
+            # letter second. Using [-1] for everything sent both files to
+            # whichever input came last in the DOM (the cover-letter slot).
+            if file_type == "resume":
+                target = file_inputs[0]
+                slot = "first"
+            else:
+                target = file_inputs[-1] if len(file_inputs) > 1 else file_inputs[0]
+                slot = "last" if len(file_inputs) > 1 else "first"
+            target.set_input_files(file_path)
             time.sleep(1)
-            return f"Uploaded {file_type}: {file_path}"
+            return (
+                f"Uploaded {file_type} to {slot} file input "
+                f"({len(file_inputs)} file inputs present): {file_path}"
+            )
         else:
             try:
                 with page.expect_file_chooser(timeout=5000) as fc_info:
@@ -580,10 +684,13 @@ def execute_tool(page, tool_name: str, tool_input: dict, dry_run: bool) -> str:
     return f"Unknown tool: {tool_name}"
 
 
-def fill_form(client: anthropic.Anthropic, dry_run: bool):
+def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> str:
     print("\n🌐 Phase 4: Filling application form...")
     if dry_run:
         print("  ⚠️  DRY RUN MODE — will not click Submit")
+
+    form_fill_system = _build_form_fill_system(resume_text)
+    done_status: str = "max_steps_reached"
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -598,15 +705,18 @@ def fill_form(client: anthropic.Anthropic, dry_run: bool):
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
         )
+        # Patch ~15 fingerprint vectors Cloudflare Turnstile inspects
+        # (navigator.plugins/languages, canvas/WebGL hash, permissions API,
+        # chrome runtime, navigator.webdriver, etc.).
+        Stealth().apply_stealth_sync(context)
         page = context.new_page()
-        page.evaluate("delete navigator.__proto__.webdriver")
 
         print(f"  Navigating to {APPLICATION_URL}")
         page.goto(APPLICATION_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
         step = 0
-        max_steps = 60
+        max_steps = 80
         messages = []
         done = False
 
@@ -648,7 +758,7 @@ def fill_form(client: anthropic.Anthropic, dry_run: bool):
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=2048,
-                    system=FORM_FILL_SYSTEM,
+                    system=form_fill_system,
                     messages=messages,
                     tools=FORM_TOOLS,
                 )
@@ -678,6 +788,7 @@ def fill_form(client: anthropic.Anthropic, dry_run: bool):
 
                     if block.name == "done":
                         done = True
+                        done_status = block.input.get("status", "submitted")
 
                     tool_results.append(
                         {
@@ -697,12 +808,79 @@ def fill_form(client: anthropic.Anthropic, dry_run: bool):
         if not done:
             print(f"  ⚠️  Reached max steps ({max_steps}) without completion")
 
-        # Final screenshot
-        take_screenshot(page, step + 1)
+        # Human fallback: if the agent gave up on CAPTCHA, keep the browser
+        # open so Maury can click the checkbox himself, then re-check the
+        # page state to see if submission actually completed.
+        if done_status == "needs_human" and not dry_run:
+            print(
+                "\n  ⚠️  Agent could not pass the CAPTCHA on its own.\n"
+                "  ⏳ The browser will stay OPEN for 90 seconds.\n"
+                "  👉 Solve the CAPTCHA in the browser window now.\n"
+                "  The script will re-check the page state when the window closes."
+            )
+            time.sleep(90)
+
+            print("\n  Re-checking final page state...")
+            final_b64, final_path = take_screenshot(page, step + 1)
+            log_step("Final state after human-fallback window", final_path)
+            done_status = _verify_submission(client, final_b64)
+        else:
+            take_screenshot(page, step + 1)
 
         print("  Closing browser...")
         context.close()
         browser.close()
+
+    return done_status
+
+
+def _verify_submission(client: anthropic.Anthropic, screenshot_b64: str) -> str:
+    """Ask Claude whether the screenshot shows a successful submission."""
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": screenshot_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Look at this screenshot of a job application page. "
+                                "Did the application submit successfully? Look for "
+                                "confirmation text like 'Application submitted', "
+                                "'Thank you', 'We received your application', "
+                                "'Application sent', or similar success messaging. "
+                                "Respond with EXACTLY ONE of these two words and "
+                                "nothing else: submitted OR not_submitted"
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+        log_api_call(
+            "captcha_recheck",
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+        verdict = response.content[0].text.strip().lower()
+        if verdict.startswith("submitted"):
+            print("  ✅ Confirmation detected — application appears submitted.")
+            return "submitted"
+        print(f"  ✗ No confirmation detected (verdict: {verdict[:80]!r})")
+    except Exception as e:
+        print(f"  Could not verify final state: {e}")
+    return "needs_human"
 
 
 # ---------------------------------------------------------------------------
@@ -743,11 +921,9 @@ def generate_gif():
 # Phase 6: Final GitHub Push
 # ---------------------------------------------------------------------------
 
-README_TEMPLATE = """# I Applied to Opendoor Using Only AI
+README_TEMPLATE = """# I Applied to {company} Using Only AI
 
-> "AI isn't a department. It's how we work." — Opendoor
-
-When Opendoor's founder challenged applicants to apply to the Operations AI Engineer role
+{company_quote_block}When {company}'s {challenger_title} challenged applicants to apply to the {role} role
 using **only AI** for a chance to skip to the final round, I took it literally.
 
 This repo contains the agent that did it — and the proof that it worked.
@@ -770,7 +946,7 @@ GitHub Repo ←── Push ←── GIF ←── Screenshots ←── Form Fi
 1. **Parses** my resume PDF and extracts structured data
 2. **Creates** this GitHub repo (solving the chicken-and-egg: the cover letter links here)
 3. **Generates** a tailored, self-referential cover letter using Claude's API
-4. **Opens** the Rippling ATS form in a real browser
+4. **Opens** the ATS form in a real browser
 5. **Uses Claude's vision API** to dynamically discover and fill every field
 6. **Uploads** my resume and the AI-generated cover letter
 7. **Records** the entire process as a GIF
@@ -807,6 +983,12 @@ playwright install chromium
 cp .env.example .env
 # Edit .env with your ANTHROPIC_API_KEY and GITHUB_TOKEN
 
+# Add your personal details (gitignored)
+cp applicant.example.json applicant.json
+# Edit applicant.json with your name, email, phone, etc.
+
+# Edit job.json to point at the role you are applying to.
+
 # Dry run (fills form without submitting)
 python apply.py --dry-run
 
@@ -825,7 +1007,7 @@ Total Claude API cost for this application: **${total_cost:.2f}**
 ## Why This Matters
 
 This isn't just a job application — it's a working prototype of the kind of AI-powered
-operational workflow I'd build at Opendoor every day.
+operational workflow I'd build at {company} every day.
 
 It handles **ambiguity** (unknown form fields discovered via vision), integrates **multiple APIs**
 (Claude, GitHub, Playwright), produces **auditable output** (screenshots, logs, cost tracking),
@@ -854,7 +1036,16 @@ def update_readme_and_push():
         )
     cost_table = "\n".join(cost_rows)
 
+    company_quote = JOB.get("company_quote", "").strip()
+    company_quote_block = (
+        f"> {company_quote}\n\n" if company_quote else ""
+    )
+
     readme = README_TEMPLATE.format(
+        company=JOB["company"],
+        role=JOB["role_title"],
+        challenger_title=JOB.get("challenger_title", "hiring team"),
+        company_quote_block=company_quote_block,
         repo_url=REPO_URL,
         repo_name=REPO_NAME,
         total_cost=run_log["total_cost_usd"],
@@ -888,8 +1079,15 @@ def update_readme_and_push():
     for src in SCREENSHOTS_DIR.glob("step_*.png"):
         shutil.copy2(src, screenshots_repo / src.name)
 
-    # Copy source files
-    for src_name in ["apply.py", "requirements.txt", ".env.example", ".gitignore"]:
+    # Copy source files (NEVER copy applicant.json — it contains personal data and is gitignored)
+    for src_name in [
+        "apply.py",
+        "requirements.txt",
+        ".env.example",
+        ".gitignore",
+        "applicant.example.json",
+        "job.json",
+    ]:
         src = BASE_DIR / src_name
         if src.exists():
             shutil.copy2(src, repo_dir / src_name)
@@ -922,7 +1120,7 @@ def update_readme_and_push():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI Job Application Agent for Opendoor")
+    parser = argparse.ArgumentParser(description="AI Job Application Agent")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -944,7 +1142,7 @@ def main():
     run_log["dry_run"] = args.dry_run
 
     print("=" * 60)
-    print("  OPENDOOR AI APPLICATION AGENT")
+    print(f"  AI APPLICATION AGENT — {JOB['company'].upper()}")
     print("  " + ("DRY RUN" if args.dry_run else "LIVE RUN"))
     print("=" * 60)
 
@@ -973,8 +1171,10 @@ def main():
     render_cover_letter_pdf(cover_letter_text)
 
     # Phase 4
+    form_status = "skipped"
     if not args.skip_form:
-        fill_form(client, dry_run=args.dry_run)
+        form_status = fill_form(client, resume_text, dry_run=args.dry_run)
+        run_log["form_fill_status"] = form_status
 
     # Phase 5
     generate_gif()
@@ -983,8 +1183,20 @@ def main():
     run_log["end_time"] = datetime.now(timezone.utc).isoformat()
     save_log()
 
+    push_ok = (
+        args.skip_form
+        or args.dry_run
+        or form_status == "submitted"
+    )
     if not args.skip_github:
-        update_readme_and_push()
+        if push_ok:
+            update_readme_and_push()
+        else:
+            print(
+                f"\n⚠️  Skipping GitHub push because form submission did not complete "
+                f"(status: {form_status}).\n"
+                f"   Complete the application in the browser, then re-run to push artifacts."
+            )
 
     print("\n" + "=" * 60)
     print("  COMPLETE!")
