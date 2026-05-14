@@ -43,24 +43,46 @@ from apply import (
 POLL_INTERVAL_SECONDS = 0.5
 MAX_POLL_MINUTES = 10
 INSPECT_WINDOW_SECONDS = 60
-CDP_ENDPOINT = "http://localhost:9222"
+CDP_ENDPOINT = "http://127.0.0.1:9222"
 
 CDP_INSTRUCTIONS = f"""
 To use --cdp mode:
 
-  1. Fully quit Chrome (Cmd+Q — all windows must be closed).
-  2. Relaunch Chrome with the remote-debugging flag. From a terminal:
+  1. Fully quit Chrome. macOS keeps Chrome alive even after closing windows,
+     so explicitly kill it:
 
-       open -a "Google Chrome" --args --remote-debugging-port=9222
+       killall "Google Chrome"
 
-     (Chrome opens to a blank tab. Do NOT navigate to Rippling yet.)
-  3. Run this script:  python diagnose_captcha.py --cdp
-  4. When the script says "Hook installed", navigate to the application URL
-     in your Chrome window:
+     (No error if nothing was running — that's fine.)
+
+  2. Launch Chrome directly (NOT via `open`, which can silently skip flags
+     when an existing process is still around), with a dedicated debug
+     profile so it doesn't fight your normal Chrome session:
+
+       /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
+         --remote-debugging-port=9222 \\
+         --user-data-dir="$HOME/.chrome-cdp-debug"
+
+     A Chrome window opens to a blank tab. Leave it open. Do NOT navigate
+     to Rippling yet.
+
+  3. Confirm Chrome is actually listening on 9222 before running the
+     diagnostic. From another terminal:
+
+       curl -s http://127.0.0.1:9222/json/version
+
+     You should see JSON with a "webSocketDebuggerUrl" field. If you see
+     "Connection refused" or nothing, Chrome did not bind the port —
+     re-do step 2.
+
+  4. Run this script:  python diagnose_captcha.py --cdp
+
+  5. When the script says "Hook installed", navigate to the application
+     URL in your Chrome window:
 
        {APPLICATION_URL}
 
-  5. Fill the form and click Apply. The script will narrate state and
+  6. Fill the form and click Apply. The script will narrate state and
      auto-solve the Turnstile widget as soon as one renders.
 """
 
