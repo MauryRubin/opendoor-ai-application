@@ -599,20 +599,46 @@ def _extract_turnstile_sitekey(page) -> "str | None":
         return None
     return locator.get_attribute("data-sitekey")
 
-def _inject_turnstile_token(page, token: str) -> None:
-    """Inject a solved Turnstile token into the page's response field
-    and fire input/change events so Cloudflare's callback observes the change."""
-    page.evaluate(
+def _inject_turnstile_token(page, token: str) -> dict:
+    """Deliver a solved Turnstile token to the page in the same way Cloudflare's
+    widget would on a real verification:
+
+      1. Call window.__cfTurnstileCallback(token) — this is the function the
+         page registered as Turnstile's `callback` and is what actually drives
+         submission for managed widgets (Rippling).
+      2. Set window.turnstile's known response inputs (defensive — for widgets
+         that ALSO read the hidden input).
+
+    Returns a dict describing which delivery paths fired, for diagnostics.
+    """
+    result = page.evaluate(
         """(token) => {
-            const selector = 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]';
-            document.querySelectorAll(selector).forEach((el) => {
-                el.value = token;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            });
+            const outcome = { calledCallback: false, setInputs: 0, errors: [] };
+            try {
+                if (typeof window.__cfTurnstileCallback === 'function') {
+                    window.__cfTurnstileCallback(token);
+                    outcome.calledCallback = true;
+                }
+            } catch (e) {
+                outcome.errors.push('callback: ' + String(e));
+            }
+            try {
+                const selector =
+                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]';
+                document.querySelectorAll(selector).forEach((el) => {
+                    el.value = token;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    outcome.setInputs += 1;
+                });
+            } catch (e) {
+                outcome.errors.push('input: ' + String(e));
+            }
+            return outcome;
         }""",
         token,
     )
+    return result
 
 def solve_turnstile_if_present(page) -> bool:
     """If a Turnstile widget is visible on the page, solve it via 2captcha
@@ -644,7 +670,14 @@ def solve_turnstile_if_present(page) -> bool:
         return False
 
     print(f"  ✅ Got token ({len(token)} chars) — injecting into page")
-    _inject_turnstile_token(page, token)
+    delivery = _inject_turnstile_token(page, token)
+    print(
+        f"  → callback fired: {delivery.get('calledCallback')}, "
+        f"hidden inputs set: {delivery.get('setInputs')}, "
+        f"errors: {delivery.get('errors') or 'none'}"
+    )
+    # Give Rippling's onSubmit handler time to fire after the callback.
+    page.wait_for_timeout(2000)
 
     run_log["api_calls"].append({
         "timestamp": datetime.now(timezone.utc).isoformat(),
