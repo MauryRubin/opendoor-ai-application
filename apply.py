@@ -792,6 +792,8 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
                     # Give Cloudflare's callback a moment, then re-screenshot
                     page.wait_for_timeout(3000)
                     screenshot_b64, screenshot_path = take_screenshot(page, step)
+                else:
+                    print("  ⚠️  Turnstile solve failed — agent will see the widget and likely stall.")
 
             dry_run_note = ""
             if dry_run:
