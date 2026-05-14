@@ -647,7 +647,12 @@ def solve_turnstile_if_present(page) -> bool:
     """
     sitekey = _extract_turnstile_sitekey(page)
     if not sitekey:
-        return True
+        # Caller already gated on widget visibility; getting here means
+        # detection failed (no captured sitekey, no [data-sitekey] in DOM).
+        print("  ⚠️  Turnstile widget seen but no sitekey captured — solver skipped.")
+        return False
+
+    print(f"  🔎 Captured Turnstile sitekey: {sitekey[:16]}...")
 
     if not TWOCAPTCHA_API_KEY:
         print("  ⚠️  Turnstile detected but TWOCAPTCHA_API_KEY is not set — cannot solve.")
@@ -882,9 +887,19 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
 
             screenshot_b64, screenshot_path = take_screenshot(page, step)
 
-            # Auto-solve Cloudflare Turnstile so the agent never has to handle it
+            # Auto-solve Cloudflare Turnstile so the agent never has to handle it.
+            # Trigger on EITHER a captured sitekey OR a visible Cloudflare iframe.
             try:
-                if _extract_turnstile_sitekey(page):
+                has_cf_iframe = page.locator(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                ).count() > 0
+                has_sitekey = bool(_extract_turnstile_sitekey(page))
+                if has_cf_iframe or has_sitekey:
+                    print(
+                        f"  🛡️  Turnstile widget present "
+                        f"(iframe={has_cf_iframe}, sitekey_captured={has_sitekey}) "
+                        f"— attempting auto-solve"
+                    )
                     solved = solve_turnstile_if_present(page)
                     if solved:
                         # Give Cloudflare's callback a moment, then re-screenshot
