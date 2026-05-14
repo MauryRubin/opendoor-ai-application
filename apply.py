@@ -528,6 +528,21 @@ def _extract_turnstile_sitekey(page) -> "str | None":
         return None
     return locator.get_attribute("data-sitekey")
 
+def _inject_turnstile_token(page, token: str) -> None:
+    """Inject a solved Turnstile token into the page's response field
+    and fire input/change events so Cloudflare's callback observes the change."""
+    page.evaluate(
+        """(token) => {
+            const selector = 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]';
+            document.querySelectorAll(selector).forEach((el) => {
+                el.value = token;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }""",
+        token,
+    )
+
 def _build_form_fill_system(resume_text: str) -> str:
     return f"""You are an AI agent filling out a job application form on behalf of an applicant.
 You can see a screenshot of the current browser page. Your job is to identify form fields, look up the correct answer in the reference material below, and fill them accurately.
