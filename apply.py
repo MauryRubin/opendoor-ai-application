@@ -523,6 +523,62 @@ FORM_TOOLS = [
     },
 ]
 
+def _install_turnstile_hook(context) -> None:
+    """Inject an init script that records the sitekey + callback the moment
+    Rippling's code calls `turnstile.render(container, params)`. Cloudflare
+    Turnstile in "managed" mode never writes the sitekey to the DOM, so this
+    is the only reliable way to recover it.
+
+    Captured values land on:
+      window.__cfTurnstileSitekey   — string (last sitekey rendered)
+      window.__cfTurnstileCallback  — function(token) (last callback registered)
+      window.__cfTurnstileWidgetId  — string (widget id returned by render)
+    """
+    context.add_init_script(
+        """
+        (() => {
+            const captureParams = (params) => {
+                try {
+                    if (params && params.sitekey) {
+                        window.__cfTurnstileSitekey = params.sitekey;
+                    }
+                    if (params && typeof params.callback === 'function') {
+                        window.__cfTurnstileCallback = params.callback;
+                    }
+                } catch (e) { /* never break the page */ }
+            };
+
+            const wrapRender = (realRender) => function (container, params) {
+                captureParams(params);
+                const widgetId = realRender.call(this, container, params);
+                try { window.__cfTurnstileWidgetId = widgetId; } catch (e) {}
+                return widgetId;
+            };
+
+            // If turnstile is already defined (unlikely this early), wrap now.
+            if (window.turnstile && typeof window.turnstile.render === 'function') {
+                window.turnstile.render = wrapRender(window.turnstile.render);
+                return;
+            }
+
+            // Otherwise wait for Cloudflare's script to assign window.turnstile,
+            // and wrap render the moment it appears.
+            let _ts;
+            Object.defineProperty(window, 'turnstile', {
+                configurable: true,
+                get() { return _ts; },
+                set(v) {
+                    _ts = v;
+                    if (v && typeof v.render === 'function') {
+                        v.render = wrapRender(v.render);
+                    }
+                },
+            });
+        })();
+        """
+    )
+
+
 def _extract_turnstile_sitekey(page) -> "str | None":
     """Find the Cloudflare Turnstile sitekey on the page, if present."""
     locator = page.locator("[data-sitekey]").first
@@ -760,6 +816,9 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
         # (navigator.plugins/languages, canvas/WebGL hash, permissions API,
         # chrome runtime, navigator.webdriver, etc.).
         Stealth().apply_stealth_sync(context)
+        # Hook turnstile.render so we can recover the sitekey + callback
+        # (Rippling renders Turnstile in managed mode — sitekey is not in DOM).
+        _install_turnstile_hook(context)
         page = context.new_page()
 
         print(f"  Navigating to {APPLICATION_URL}")
