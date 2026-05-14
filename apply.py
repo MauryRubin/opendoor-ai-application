@@ -641,9 +641,12 @@ def _inject_turnstile_token(page, token: str) -> dict:
     return result
 
 def solve_turnstile_if_present(page) -> bool:
-    """If a Turnstile widget is visible on the page, solve it via 2captcha
-    and inject the resulting token. Returns True if there was nothing to solve
-    OR the solve succeeded; False if a Turnstile was present but solving failed.
+    """Solve a Turnstile widget that the caller has already confirmed is present
+    on the page, and deliver the token. Callers must pre-gate on widget
+    visibility — invoking this when no widget is up is a programming error.
+
+    Returns True if the solve succeeded; False if the sitekey could not be
+    captured, the 2captcha key is missing, or solving otherwise failed.
     """
     sitekey = _extract_turnstile_sitekey(page)
     if not sitekey:
