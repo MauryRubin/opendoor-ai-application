@@ -631,7 +631,7 @@ RULES:
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
 4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
-5. CAPTCHA HANDLING — Cloudflare Turnstile is automatically solved by the system BEFORE you see each screenshot. You will rarely see one. If you DO see a "Verify you are human" widget, just call the `wait` tool with seconds=5 — the system will solve it on the next cycle. NEVER click a Turnstile checkbox yourself; the click pattern is what Cloudflare uses to flag bots.
+5. CAPTCHA HANDLING — Cloudflare Turnstile is automatically solved by the system BEFORE you see each screenshot. You will rarely see one. If you DO see a "Verify you are human" widget, just call the `wait` tool with seconds=5 — the system will solve it on the next cycle. NEVER click a Turnstile checkbox yourself; the click pattern is what Cloudflare uses to flag bots. If the SAME CAPTCHA persists after calling wait(5) TWICE in a row, the auto-solver has failed — call done with status "needs_human" so a human can take over.
 6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
 7. After submission, if you see a confirmation page, call done with status "submitted".
 8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
@@ -778,14 +778,17 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> s
             screenshot_b64, screenshot_path = take_screenshot(page, step)
 
             # Auto-solve Cloudflare Turnstile so the agent never has to handle it
-            if _extract_turnstile_sitekey(page):
-                solved = solve_turnstile_if_present(page)
-                if solved:
-                    # Give Cloudflare's callback a moment, then re-screenshot
-                    page.wait_for_timeout(3000)
-                    screenshot_b64, screenshot_path = take_screenshot(page, step)
-                else:
-                    print("  ⚠️  Turnstile solve failed — agent will see the widget and likely stall.")
+            try:
+                if _extract_turnstile_sitekey(page):
+                    solved = solve_turnstile_if_present(page)
+                    if solved:
+                        # Give Cloudflare's callback a moment, then re-screenshot
+                        page.wait_for_timeout(3000)
+                        screenshot_b64, screenshot_path = take_screenshot(page, step)
+                    else:
+                        print("  ⚠️  Turnstile solve failed — agent will see the widget and likely stall.")
+            except Exception as e:
+                print(f"  ⚠️  Auto-solve raised unexpectedly: {e}. Continuing with current screenshot.")
 
             dry_run_note = ""
             if dry_run:
