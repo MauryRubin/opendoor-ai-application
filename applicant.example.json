@@ -15,5 +15,19 @@
   "current_company": "Your current company",
   "work_authorization": "Canadian citizen",
   "requires_sponsorship": "No",
-  "resume_filename": "Resume.pdf"
+  "resume_filename": "Resume.pdf",
+  "eeo_responses": {
+    "gender": "Prefer not to answer",
+    "ethnicity": "Prefer not to answer",
+    "race": "Prefer not to answer",
+    "veteran_status": "Prefer not to answer",
+    "disability_status": "Prefer not to answer",
+    "pronouns": ""
+  },
+  "consent_responses": {
+    "sms_updates": "decline",
+    "marketing_email": "decline",
+    "application_status_updates": "accept",
+    "terms_and_privacy": "accept"
+  }
 }

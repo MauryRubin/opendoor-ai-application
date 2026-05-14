@@ -18,6 +18,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -301,6 +302,44 @@ def _latin1_safe(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
+_URL_PATTERN = re.compile(r"(https?://[^\s)]+)")
+
+
+_URL_TRAIL_PUNCT = ".,;:!?\"')]}>"
+
+
+def _split_url_and_trailing(raw: str) -> tuple[str, str]:
+    """Strip trailing punctuation / em-dash from URL; return (url, trailing)."""
+    trailing = ""
+    while raw and raw[-1] in _URL_TRAIL_PUNCT:
+        trailing = raw[-1] + trailing
+        raw = raw[:-1]
+    if raw.endswith("--"):
+        trailing = "--" + trailing
+        raw = raw[:-2]
+    return raw, trailing
+
+
+def _write_paragraph_with_links(pdf, paragraph: str, line_height: float = 6.0):
+    """Render a paragraph with auto-wrap, turning URLs into clickable blue links."""
+    parts = _URL_PATTERN.split(paragraph)
+    for part in parts:
+        if not part:
+            continue
+        if _URL_PATTERN.match(part):
+            url, trailing = _split_url_and_trailing(part)
+            pdf.set_text_color(0, 0, 200)
+            pdf.set_font("Helvetica", "U", size=11)
+            pdf.write(line_height, url, link=url)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", size=11)
+            if trailing:
+                pdf.write(line_height, trailing)
+        else:
+            pdf.write(line_height, part)
+    pdf.ln(line_height + 4)
+
+
 def render_cover_letter_pdf(letter_text: str):
     print("  Rendering cover letter to PDF...")
     letter_text = _latin1_safe(letter_text)
@@ -325,13 +364,12 @@ def render_cover_letter_pdf(letter_text: str):
     pdf.cell(0, 5, header_meta, new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(10)
 
-    pdf.set_font("Helvetica", size=11)
+    pdf.set_font("Helvetica", "", size=11)
     for paragraph in letter_text.split("\n\n"):
         paragraph = paragraph.strip()
         if not paragraph:
             continue
-        pdf.multi_cell(0, 6, paragraph)
-        pdf.ln(4)
+        _write_paragraph_with_links(pdf, paragraph)
 
     pdf.output(str(COVER_LETTER_PATH))
     print(f"  Saved to {COVER_LETTER_PATH}")
@@ -507,20 +545,34 @@ HOW TO ANSWER FIELDS:
   - Identity / contact / authorization fields → APPLICANT JSON above.
   - Experience / education / skills / past employers / accomplishments → RESUME TEXT above.
   - Role-targeting fields (e.g. "which position?") → ROLE CONTEXT above.
+  - Voluntary disclosure / EEO fields (gender, ethnicity, race, veteran status, disability status, pronouns) → use APPLICANT.eeo_responses if present, otherwise select the option closest to "Prefer not to answer" / "Decline to disclose" / "I don't wish to answer". NEVER guess these from the resume.
+  - Consent / opt-in fields (SMS updates, marketing emails, "I agree to terms", privacy policy, application status updates) → use APPLICANT.consent_responses if present, with these defaults if a specific field isn't listed:
+      * SMS / text-message updates → DECLINE / select "No" (privacy-preserving default)
+      * Marketing / promotional email → DECLINE / select "No"
+      * Application status updates → ACCEPT / select "Yes" (applicant wants to hear back)
+      * Required terms-of-service / privacy-policy / "I confirm the information is accurate" → ACCEPT / check the box (otherwise the form cannot be submitted)
 - If a field has no obvious match in any reference material, choose the safest reasonable answer from what IS present. Do NOT invent facts about the applicant that aren't in the resume or applicant data.
 - For free-form "Why this company?" or "Why this role?" boxes, draw on the resume + role context to write a brief, honest answer.
+
+FILE UPLOAD RULES (important — past runs got stuck here):
+- The form has separate inputs for resume and cover letter. Each upload_file call routes correctly based on the file_type argument.
+- Upload each file EXACTLY ONCE. Do not re-upload to "fix" what looks wrong in a screenshot — the screenshots are slow to refresh.
+- After calling upload_file once for "resume" and once for "cover_letter", consider the upload section done and MOVE ON, even if the previewed filename looks confusing. Trust the tool calls succeeded.
 
 RULES:
 1. Examine the screenshot carefully. Describe what you see before acting.
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
-4. For file uploads: click the upload button/area, then use the upload_file tool.
+4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
 5. If you see a CAPTCHA or something blocking, call done with status "needs_human".
 6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
 7. After submission, if you see a confirmation page, call done with status "submitted".
-8. If a field is already filled correctly, skip it.
+8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
 9. Be precise with coordinates — click the CENTER of input fields and buttons.
 10. If you need to see more of the page, use the scroll tool.
+11. Make forward progress. Don't loop back to re-check fields you've already completed — fill from top to bottom and only revisit if you hit a validation error after attempting Submit.
+12. CRITICAL: Before declaring "done", scroll all the way to the bottom of the form and confirm the Submit / Apply button is ENABLED (not grayed out). A grayed-out Apply button means a required field is still unanswered — usually a consent radio, terms checkbox, or skipped dropdown further down. Find it, fill it, then verify Apply is enabled. Only THEN click Submit (or in dry-run mode, call done with status "submitted").
+13. Required radio groups (e.g. "Yes / No - I consent to receiving text messages") MUST have one option selected. If neither is selected, the form won't submit. Use the consent rules above to pick the correct option.
 """
 
 
@@ -564,9 +616,21 @@ def execute_tool(page, tool_name: str, tool_input: dict, dry_run: bool) -> str:
         )
         file_inputs = page.query_selector_all('input[type="file"]')
         if file_inputs:
-            file_inputs[-1].set_input_files(file_path)
+            # Route by file_type — most ATS forms list resume first, cover
+            # letter second. Using [-1] for everything sent both files to
+            # whichever input came last in the DOM (the cover-letter slot).
+            if file_type == "resume":
+                target = file_inputs[0]
+                slot = "first"
+            else:
+                target = file_inputs[-1] if len(file_inputs) > 1 else file_inputs[0]
+                slot = "last" if len(file_inputs) > 1 else "first"
+            target.set_input_files(file_path)
             time.sleep(1)
-            return f"Uploaded {file_type}: {file_path}"
+            return (
+                f"Uploaded {file_type} to {slot} file input "
+                f"({len(file_inputs)} file inputs present): {file_path}"
+            )
         else:
             try:
                 with page.expect_file_chooser(timeout=5000) as fc_info:
@@ -632,7 +696,7 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool):
         page.wait_for_timeout(3000)
 
         step = 0
-        max_steps = 60
+        max_steps = 80
         messages = []
         done = False
 
