@@ -115,15 +115,28 @@ def _fmt_state(state: dict) -> str:
     )
 
 
-def _find_rippling_page(context):
-    """Return the first page in `context` whose URL contains 'rippling.com'."""
-    for page in context.pages:
-        try:
-            if "rippling.com" in (page.url or ""):
-                return page
-        except Exception:
-            continue
+def _find_rippling_page(browser):
+    """Return the first page across ALL contexts whose URL contains 'rippling.com'."""
+    for ctx in browser.contexts:
+        for page in ctx.pages:
+            try:
+                if "rippling.com" in (page.url or ""):
+                    return page
+            except Exception:
+                continue
     return None
+
+
+def _list_all_pages(browser) -> list:
+    """Return [(context_idx, url), ...] for every page CDP can see."""
+    rows = []
+    for ctx_idx, ctx in enumerate(browser.contexts):
+        for page in ctx.pages:
+            try:
+                rows.append((ctx_idx, page.url or "<no url>"))
+            except Exception as e:
+                rows.append((ctx_idx, f"<error: {e}>"))
+    return rows
 
 
 def _poll_and_solve(page) -> None:
@@ -213,28 +226,42 @@ def _run_cdp_attached() -> None:
         if not browser.contexts:
             print("  ERROR: connected, but Chrome has no contexts open.")
             return
-        context = browser.contexts[0]
-        _install_turnstile_hook(context)
+        for ctx in browser.contexts:
+            _install_turnstile_hook(ctx)
 
         print()
         print(f"  >> Connected to Chrome at {CDP_ENDPOINT}.")
-        print("  >> Hook installed on the default context.")
-        print(f"  >> Now navigate to the application URL in your Chrome window:")
+        print(f"  >> Hook installed on {len(browser.contexts)} context(s).")
+        print(f"  >> Open this URL in the SAME Chrome window you launched with the debug flag:")
         print(f"     {APPLICATION_URL}")
         print()
         print("  >> Waiting up to 5 minutes for a tab with rippling.com to appear...")
+        print("  >> (Logging every visible tab every 10s so you can debug.)")
 
         deadline = time.time() + 300
         page = None
+        next_log = 0.0
         while time.time() < deadline:
-            page = _find_rippling_page(context)
+            page = _find_rippling_page(browser)
             if page:
                 break
+            now = time.time()
+            if now >= next_log:
+                pages = _list_all_pages(browser)
+                if pages:
+                    print(f"  [tabs] {len(pages)} tab(s) visible to CDP:")
+                    for ctx_idx, url in pages:
+                        print(f"           ctx#{ctx_idx}: {url}")
+                else:
+                    print("  [tabs] no tabs visible to CDP — Chrome's debug profile may be empty.")
+                next_log = now + 10
             time.sleep(1)
 
         if not page:
             print()
             print("  >> No rippling.com tab appeared within 5 minutes. Aborting.")
+            print("  >> If you DID open the URL, it was likely in a different Chrome window")
+            print("  >> than the one launched with --remote-debugging-port=9222.")
             return
 
         print(f"  >> Found tab: {page.url}")
