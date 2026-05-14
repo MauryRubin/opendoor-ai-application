@@ -1,6 +1,10 @@
 venv/
 .env
+applicant.json
 __pycache__/
 *.pyc
-output/videos/
+output/
 .DS_Store
+opendoor-ai-application/
+CLAUDE.md
+
