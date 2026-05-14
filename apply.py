@@ -44,6 +44,7 @@ load_dotenv(BASE_DIR / ".env", override=True)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY")
 MODEL = "claude-sonnet-4-20250514"
 
 
@@ -542,6 +543,48 @@ def _inject_turnstile_token(page, token: str) -> None:
         }""",
         token,
     )
+
+def solve_turnstile_if_present(page) -> bool:
+    """If a Turnstile widget is visible on the page, solve it via 2captcha
+    and inject the resulting token. Returns True if there was nothing to solve
+    OR the solve succeeded; False if a Turnstile was present but solving failed.
+    """
+    sitekey = _extract_turnstile_sitekey(page)
+    if not sitekey:
+        return True
+
+    if not TWOCAPTCHA_API_KEY:
+        print("  ⚠️  Turnstile detected but TWOCAPTCHA_API_KEY is not set — cannot solve.")
+        return False
+
+    from twocaptcha import TwoCaptcha
+    solver = TwoCaptcha(TWOCAPTCHA_API_KEY)
+    page_url = page.url
+
+    print(f"  🔓 Solving Turnstile via 2captcha (sitekey={sitekey[:16]}...)")
+    try:
+        result = solver.turnstile(sitekey=sitekey, url=page_url)
+    except Exception as exc:
+        print(f"  ❌ 2captcha solve failed: {exc}")
+        return False
+
+    token = result.get("code") if isinstance(result, dict) else None
+    if not token:
+        print(f"  ❌ 2captcha returned no token: {result}")
+        return False
+
+    print(f"  ✅ Got token ({len(token)} chars) — injecting into page")
+    _inject_turnstile_token(page, token)
+
+    run_log["api_calls"].append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "purpose": "twocaptcha_turnstile_solve",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.003,
+    })
+    run_log["total_cost_usd"] = round(run_log["total_cost_usd"] + 0.003, 4)
+    return True
 
 def _build_form_fill_system(resume_text: str) -> str:
     return f"""You are an AI agent filling out a job application form on behalf of an applicant.
