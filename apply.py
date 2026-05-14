@@ -1065,6 +1065,12 @@ Total Claude API cost for this application: **${total_cost:.2f}**
 |------|-----------|------------|------|
 {cost_table}
 
+## Design Choices
+
+**One external service: 2captcha.** The agent handles 100% of the application except for solving Cloudflare Turnstile (the "Verify you are human" CAPTCHA Rippling shows on submit). For that one step the agent calls the 2captcha API, which returns a valid token in ~30 seconds. CAPTCHAs are *literally designed* to require human intervention, so delegating that single step to a paid solving service is the honest architectural choice — more honest than pretending to defeat Cloudflare's anti-bot fingerprinting. Cost: ~$0.003 per solve.
+
+Everything else (parsing the resume, writing the cover letter, navigating the form, picking dropdown options, uploading files, choosing consent answers, clicking Submit, verifying success, pushing the artifacts) runs locally on the Anthropic + Playwright stack.
+
 ## Why This Matters
 
 This isn't just a job application — it's a working prototype of the kind of AI-powered
