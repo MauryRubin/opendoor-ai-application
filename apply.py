@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 from fpdf import FPDF
 from PIL import Image
 from playwright.sync_api import sync_playwright
+from playwright_stealth import Stealth
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -564,7 +565,15 @@ RULES:
 2. Perform ONE logical action per turn (e.g., click a field, then type in the next turn — or click and type if the field is clearly ready).
 3. For dropdowns: first click to open, wait for the next screenshot, then select the option.
 4. For file uploads: click the upload button/area, then use the upload_file tool. See FILE UPLOAD RULES above.
-5. If you see a CAPTCHA or something blocking, call done with status "needs_human".
+5. CAPTCHA HANDLING — If you see a Cloudflare Turnstile widget, "Verify you are human" checkbox, reCAPTCHA, or any human-verification challenge:
+   a. CLICK THE CHECKBOX directly at its center coordinates. The browser has been patched to look human; clicking the checkbox is what Turnstile needs to trigger its (invisible) verification check.
+   b. IMMEDIATELY after the click, call `wait` with seconds=8. Turnstile runs verification invisibly during this wait — DO NOT re-click or panic if no visible change happens for 5-10 seconds.
+   c. On the next turn, look at the new screenshot:
+      - If the checkbox now shows a green checkmark, the page has progressed, OR a confirmation message appears → continue toward Submit / confirmation.
+      - If the page shows a "verification failed" message or the checkbox is still empty after the wait → call wait again with seconds=5, then re-check.
+   d. Repeat the wait/check cycle up to 3 times if needed.
+   e. ONLY after 3 full cycles where the CAPTCHA still blocks progress should you call done with status "needs_human".
+   f. If you see a confirmation page ("Application submitted", "Thank you", "We've received your application", "Application sent", etc.) call done with status "submitted".
 6. When all fields are filled and you see a Submit/Apply button, click it (unless in dry-run mode — I will tell you if dry-run is active).
 7. After submission, if you see a confirmation page, call done with status "submitted".
 8. If a field is already filled correctly, skip it. Do not re-fill or re-upload already-completed fields.
@@ -668,12 +677,13 @@ def execute_tool(page, tool_name: str, tool_input: dict, dry_run: bool) -> str:
     return f"Unknown tool: {tool_name}"
 
 
-def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool):
+def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool) -> str:
     print("\n🌐 Phase 4: Filling application form...")
     if dry_run:
         print("  ⚠️  DRY RUN MODE — will not click Submit")
 
     form_fill_system = _build_form_fill_system(resume_text)
+    done_status: str = "max_steps_reached"
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -688,8 +698,11 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool):
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
         )
+        # Patch ~15 fingerprint vectors Cloudflare Turnstile inspects
+        # (navigator.plugins/languages, canvas/WebGL hash, permissions API,
+        # chrome runtime, navigator.webdriver, etc.).
+        Stealth().apply_stealth_sync(context)
         page = context.new_page()
-        page.evaluate("delete navigator.__proto__.webdriver")
 
         print(f"  Navigating to {APPLICATION_URL}")
         page.goto(APPLICATION_URL, wait_until="domcontentloaded")
@@ -768,6 +781,7 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool):
 
                     if block.name == "done":
                         done = True
+                        done_status = block.input.get("status", "submitted")
 
                     tool_results.append(
                         {
@@ -787,12 +801,79 @@ def fill_form(client: anthropic.Anthropic, resume_text: str, dry_run: bool):
         if not done:
             print(f"  ⚠️  Reached max steps ({max_steps}) without completion")
 
-        # Final screenshot
-        take_screenshot(page, step + 1)
+        # Human fallback: if the agent gave up on CAPTCHA, keep the browser
+        # open so Maury can click the checkbox himself, then re-check the
+        # page state to see if submission actually completed.
+        if done_status == "needs_human" and not dry_run:
+            print(
+                "\n  ⚠️  Agent could not pass the CAPTCHA on its own.\n"
+                "  ⏳ The browser will stay OPEN for 90 seconds.\n"
+                "  👉 Solve the CAPTCHA in the browser window now.\n"
+                "  The script will re-check the page state when the window closes."
+            )
+            time.sleep(90)
+
+            print("\n  Re-checking final page state...")
+            final_b64, final_path = take_screenshot(page, step + 1)
+            log_step("Final state after human-fallback window", final_path)
+            done_status = _verify_submission(client, final_b64)
+        else:
+            take_screenshot(page, step + 1)
 
         print("  Closing browser...")
         context.close()
         browser.close()
+
+    return done_status
+
+
+def _verify_submission(client: anthropic.Anthropic, screenshot_b64: str) -> str:
+    """Ask Claude whether the screenshot shows a successful submission."""
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": screenshot_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Look at this screenshot of a job application page. "
+                                "Did the application submit successfully? Look for "
+                                "confirmation text like 'Application submitted', "
+                                "'Thank you', 'We received your application', "
+                                "'Application sent', or similar success messaging. "
+                                "Respond with EXACTLY ONE of these two words and "
+                                "nothing else: submitted OR not_submitted"
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+        log_api_call(
+            "captcha_recheck",
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+        verdict = response.content[0].text.strip().lower()
+        if verdict.startswith("submitted"):
+            print("  ✅ Confirmation detected — application appears submitted.")
+            return "submitted"
+        print(f"  ✗ No confirmation detected (verdict: {verdict[:80]!r})")
+    except Exception as e:
+        print(f"  Could not verify final state: {e}")
+    return "needs_human"
 
 
 # ---------------------------------------------------------------------------
@@ -1083,8 +1164,10 @@ def main():
     render_cover_letter_pdf(cover_letter_text)
 
     # Phase 4
+    form_status = "skipped"
     if not args.skip_form:
-        fill_form(client, resume_text, dry_run=args.dry_run)
+        form_status = fill_form(client, resume_text, dry_run=args.dry_run)
+        run_log["form_fill_status"] = form_status
 
     # Phase 5
     generate_gif()
@@ -1093,8 +1176,20 @@ def main():
     run_log["end_time"] = datetime.now(timezone.utc).isoformat()
     save_log()
 
+    push_ok = (
+        args.skip_form
+        or args.dry_run
+        or form_status == "submitted"
+    )
     if not args.skip_github:
-        update_readme_and_push()
+        if push_ok:
+            update_readme_and_push()
+        else:
+            print(
+                f"\n⚠️  Skipping GitHub push because form submission did not complete "
+                f"(status: {form_status}).\n"
+                f"   Complete the application in the browser, then re-run to push artifacts."
+            )
 
     print("\n" + "=" * 60)
     print("  COMPLETE!")
